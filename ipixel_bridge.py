@@ -446,6 +446,9 @@ def make_handler(bridge):
 # Bit planes: plane 0 (lowest bit) first, each w*h/8 bytes, row by row, bit i of a byte = pixel x+i.
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 DMD_DEFAULT_TINT = (255, 48, 0)          # the classic orange (dmdext's default colour)
+# the standard DMD colours (VPinMAME default, dmdext default, old dmdext default): --dmd-color only replaces these,
+# so a table that has its own colour in VPinMAME keeps it
+DMD_STANDARD_COLORS = {(255, 88, 32), (255, 69, 0), (255, 48, 0)}
 _EXP = [tuple((b >> i) & 1 for i in range(8)) for b in range(256)]
 
 def _int_rgb(v):
@@ -508,17 +511,85 @@ def dmd_downscale(w, h, rgb, scale='avg', gain=1.5, levels=4):
             px[ox, oy] = dmd_quant(c, levels)
     return img
 
+def find_dmd_ini(path=None):
+    """--dmd-ini, else the DMDDEVICE_CONFIG variable the dmdext installer sets (a file or a folder)"""
+    import os
+    path = path or os.environ.get('DMDDEVICE_CONFIG')
+    if path and os.path.isdir(path):
+        path = os.path.join(path, 'DmdDevice.ini')
+    return path if path and os.path.isfile(path) else None
+
+def read_ini(path):
+    """simple ini reader like dmdext's: {section (lower case): {key (lower case): value}}"""
+    data, sec = {}, None
+    with open(path, encoding='utf-8-sig', errors='replace') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith(';'):
+                continue
+            if line.startswith('[') and line.endswith(']'):
+                sec = data.setdefault(line[1:-1].strip().lower(), {})
+            elif '=' in line and sec is not None:
+                k, v = line.split('=', 1)
+                sec[k.strip().lower()] = v.strip()
+    return data
+
+def ini_tint(path, game):
+    """The virtual DMD tint dmdext uses for this game: (style name, (r, g, b) or None, amount 0..1).
+    The style is '[game] virtualdmd style = x' or '[virtualdmd] style = x', the colour 'style.x.tint = #AARRGGBB'
+    (AA = tint amount, 00 = no tint).  Like dmdext, the tint only applies to plain (not colourised) frames."""
+    try:
+        ini = read_ini(path)
+    except Exception as e:
+        print("DMD: cannot read", path, ":", e)
+        return None
+    vd = ini.get('virtualdmd', {})
+    gs = ini.get(game.lower(), {}) if game else {}
+    style = gs.get('virtualdmd style') or vd.get('style') or 'default'
+    key = 'style.%s.tint' % style.lower()
+    t = (gs.get('virtualdmd ' + key) or vd.get(key) or '').lstrip('#')
+    try:
+        if len(t) == 8:
+            return (style, (int(t[2:4], 16), int(t[4:6], 16), int(t[6:8], 16)), int(t[0:2], 16) / 255.0)
+        if len(t) == 6:
+            return (style, (int(t[0:2], 16), int(t[2:4], 16), int(t[4:6], 16)), 1.0)
+    except ValueError:
+        pass
+    return (style, None, 0.0)
+
 class DmdMirror:
-    def __init__(self, bridge, host='127.0.0.1', port=8766, fps=10, scale='avg', gain=None, levels=4, color=None):
+    def __init__(self, bridge, host='127.0.0.1', port=8766, fps=10, scale='avg', gain=None, levels=4, color=None, ini=None):
         self.bridge, self.host, self.port, self.fps = bridge, host, port, fps
         self.scale, self.levels = scale, max(2, levels)
         self.gain = gain if gain is not None else (1.5 if scale == 'avg' else 1.0)
-        self.fixed_tint = hexcol(color, 'ff3000') if color else None
-        self.tint, self.palette = self.fixed_tint or DMD_DEFAULT_TINT, None
+        self.fixed_tint = hexcol(color, 'ff3000') if color else None     # replaces the standard orange only
+        self.tint, self.palette = DMD_DEFAULT_TINT, None
         self.dims, self.game = (128, 32), ""
         self.latest, self.seq, self.shown_seq, self.last_key = None, 0, 0, None
         self.clients, self.idle_since, self.enabled, self.redraw = 0, time.time(), True, False
         self.n_in = self.n_out = 0
+        self.ini = find_dmd_ini(ini)
+        self.style = None                    # (name, (r, g, b), amount) from DmdDevice.ini
+        print("DMD: colours from", self.ini or "dmdext only (no DmdDevice.ini found, use --dmd-ini)")
+
+    def _load_style(self):
+        """re-read DmdDevice.ini on every game start, so changes work without restarting the bridge"""
+        self.style = ini_tint(self.ini, self.game) if self.ini else None
+        if self.style and self.style[1] and self.style[2] > 0:
+            name, rgb, a = self.style
+            print("DMD: %s uses style '%s', tint #%02x%02x%02x (%d%%)"
+                  % (self.game or "default", name, rgb[0], rgb[1], rgb[2], round(a * 100)))
+
+    def base_color(self):
+        """colour of a fully lit dot in a plain grey frame: --dmd-color, else VPinMAME's colour mixed with the
+        virtual DMD tint from DmdDevice.ini (the same mix dmdext's virtual DMD uses)"""
+        c = self.tint
+        if self.fixed_tint and c in DMD_STANDARD_COLORS:
+            c = self.fixed_tint
+        if self.style and self.style[1] and self.style[2] > 0:
+            rgb, a = self.style[1], self.style[2]
+            return tuple(int(v * (1 - a) + t * a) for v, t in zip(c, rgb))
+        return c
 
     def state(self):
         if not self.enabled:
@@ -550,6 +621,8 @@ class DmdMirror:
             await writer.drain()
             self.clients += 1
             counted = True
+            self.game = ""
+            self._load_style()               # default style until dmdext sends the game name
             print("DMD: dmdext connected")
             msg = bytearray()
             while True:
@@ -599,19 +672,25 @@ class DmdMirror:
         if name == 'dimensions':
             self.dims = struct.unpack('<ii', rest[:8])
         elif name == 'color':
-            if not self.fixed_tint:
-                self.tint = _int_rgb(struct.unpack('<i', rest[:4])[0])
+            c = _int_rgb(struct.unpack('<i', rest[:4])[0])
+            if c != self.tint:
+                self.tint = c
+                note = ""
+                if self.fixed_tint and c in DMD_STANDARD_COLORS:
+                    note = " (standard orange -> shown as #%02x%02x%02x, --dmd-color)" % self.fixed_tint
+                print("DMD: colour #%02x%02x%02x from VPinMAME%s" % (c + (note,)))
         elif name == 'clearColor':
-            if not self.fixed_tint:
-                self.tint = DMD_DEFAULT_TINT
+            self.tint = DMD_DEFAULT_TINT
         elif name == 'palette':
             n = struct.unpack('<i', rest[:4])[0]
             self.palette = [_int_rgb(v) for v in struct.unpack('<%di' % n, rest[4:4 + 4 * n])]
+            print("DMD: palette with %d colours (colourised, tint not used)" % n)
         elif name == 'clearPalette':
             self.palette = None
         elif name == 'gameName':
             self.game = rest.split(b'\0')[0].decode('ascii', 'replace')
             print("DMD: game", self.game)
+            self._load_style()
         elif name in ('gray2Planes', 'gray4Planes'):
             self._frame(int(name[4]), rest[4:], None)
         elif name in ('coloredGray2', 'coloredGray4', 'coloredGray6'):
@@ -641,7 +720,7 @@ class DmdMirror:
         self.n_in += 1
 
     def render(self, frame):
-        w, h, rgb = dmd_to_rgb(frame, self.tint, self.palette)
+        w, h, rgb = dmd_to_rgb(frame, self.base_color(), self.palette)
         return dmd_downscale(w, h, rgb, self.scale, self.gain, self.levels)
 
     # ---- drawing: always the NEWEST frame, as fast as BLE allows (frames in between are skipped)
@@ -813,9 +892,12 @@ def main():
     ap.add_argument('--dmd-scale', default='avg', choices=['avg', 'max'], help='avg = softer, max = bolder')
     ap.add_argument('--dmd-gain', type=float, default=None, help='brighten thin lines (default 1.5 avg, 1.0 max)')
     ap.add_argument('--dmd-levels', type=int, default=4, help='brightness steps incl. black (fewer = faster)')
-    ap.add_argument('--dmd-color', default=None, help='DMD colour (default: the colour dmdext sends)')
+    ap.add_argument('--dmd-color', default=None, help='replaces the standard DMD orange (tables with their own VPinMAME colour keep theirs)')
+    ap.add_argument('--dmd-ini', default=None, help='DmdDevice.ini for per-game tints (default: DMDDEVICE_CONFIG)')
     ap.add_argument('--dmd-pause', type=float, default=4, help='seconds the mirror waits after a table command')
     ap.add_argument('--out', default=None, help='dmdpreview: output file')
+    ap.add_argument('--hello', default='GET READY|TO PINBALL', help='text shown when the bridge starts ("|" = new line)')
+    ap.add_argument('--hello-color', default='ffa000', help='colour of the start text')
     ap.add_argument('cmd', choices=['scan', 'info', 'test', 'text', 'bench', 'erase', 'reset', 'raw', 'serve', 'dmdpreview'])
     ap.add_argument('msg', nargs='?', default='WUBBA LUBBA DUB DUB')
     a = ap.parse_args()
@@ -830,11 +912,11 @@ def main():
         b = Bridge(link, a.fps, a.bright, a.mode)
         b.dmd_pause = a.dmd_pause
         if a.dmd:
-            b.dmd = DmdMirror(b, a.host, a.dmd_port, a.dmd_fps, a.dmd_scale, a.dmd_gain, a.dmd_levels, a.dmd_color)
+            b.dmd = DmdMirror(b, a.host, a.dmd_port, a.dmd_fps, a.dmd_scale, a.dmd_gain, a.dmd_levels, a.dmd_color, a.dmd_ini)
         threading.Thread(target=b.run, daemon=True).start()
         srv = ThreadingHTTPServer((a.host, a.port), make_handler(b))
         print("iPixel bridge on http://%s:%d  (Ctrl+C to stop)" % (a.host, a.port))
-        b.submit(('frames', frames_for_text("RICK AND MORTY", (0, 255, 90), (0, 0, 0), 'big'), 1), http=False)
+        b.submit(('frames', frames_for_text(a.hello, hexcol(a.hello_color, 'ffa000'), (0, 0, 0), 'big'), 1), http=False)
         srv.serve_forever()
     else:
         asyncio.run(cli(a))

@@ -130,6 +130,16 @@ You can also test the connection without VPX:
 dmdext test -d network --url ws://127.0.0.1:8766/dmd
 ```
 
+### Colours
+
+The mirror uses the same colours as your virtual DMD:
+
+- **Colourised ROMs** (altcolor, Serum, VNI/PAL) are shown in their own colours.
+- **Plain ROMs** use VPinMAME's DMD colour, mixed with the **virtual DMD style tint** from `DmdDevice.ini`, just like dmdext does. If you gave a table its own style (right-click the virtual DMD → settings → tint → *Apply to "game"*), the iPixel follows it. The ini is re-read at every game start.
+- The bridge finds the ini through the `DMDDEVICE_CONFIG` variable that the dmdext installer sets, or use `--dmd-ini C:\path\DmdDevice.ini`.
+- Per-game colours set in **VPinMAME** (game options → DMD colour) are used as they are.
+- `--dmd-color` only replaces the standard orange, so it fixes the colour of cheap LEDs without touching tables that have their own colour.
+
 ### Preview without the display
 
 ```
@@ -195,8 +205,11 @@ Use `+` or `%20` for spaces in texts (`msg=GAME+OVER`). If a table also has a DM
 | `--dmd-scale` | `avg` | `avg` = softer, `max` = bolder (thin lines stay bright) |
 | `--dmd-gain` | `1.5` / `1.0` | Brighten thin lines (default depends on the scale mode) |
 | `--dmd-levels` | `4` | Brightness steps including black; fewer = fewer BLE packets |
-| `--dmd-color` | from dmdext | Force the DMD colour, e.g. `ff7000` (cheap LEDs often show orange as red) |
+| `--dmd-color` | | Replaces the standard DMD orange, e.g. `ff7000` (cheap LEDs often show orange as red). Tables with their own VPinMAME colour keep it |
+| `--dmd-ini` | `DMDDEVICE_CONFIG` | DmdDevice.ini to read per-game virtual DMD tints from |
 | `--dmd-pause` | `4` | Seconds the mirror waits after a table command |
+| `--hello` | `GET READY\|TO PINBALL` | Text shown when the bridge starts (`\|` = new line) |
+| `--hello-color` | `ffa000` | Colour of the start text |
 
 Other commands: `info`, `bench` (measures the frame rate), `erase` (deletes all stored programs on the display), `reset` (back to the display's default mode), `raw <hex>` (send a raw packet), `dmdpreview <file>`.
 
